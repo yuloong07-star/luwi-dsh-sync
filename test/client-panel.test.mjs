@@ -272,7 +272,7 @@ test('面板渲染: 通道没开时画"通道没开"那一屏, 不抛', async ()
   }
 })
 
-test('面板渲染: 有快照时三档页签与两根镜像都在, 成本预告按字节给人读的数', async () => {
+test('面板渲染: 单页里配对在最上方、两根镜像都在, 没有诊断板块与名片', async () => {
   const { definition, restore } = await loadBundle()
   const snapshot = {
     ok: true,
@@ -299,8 +299,8 @@ test('面板渲染: 有快照时三档页签与两根镜像都在, 成本预告�
       { target: 'workspace', label: '工作区', on: false, remote: { state: 'unset', display: '' }, cost: null, meta: {}, status: null },
     ],
   }
-  // useState 顺序: [bump(useLocaleTick), snap, fault, tab, pending, answer, doctor, peers, auto, busy, copied, actionTarget, loadedAt]
-  const React = fakeReact([0, snapshot, null, 'overview'])
+  // useState 顺序: [bump(useLocaleTick), snap, fault, pending, answer, auto, busy, copied, actionTarget, loadedAt]
+  const React = fakeReact([0, snapshot, null])
   const services = sidebarServices()
   const restoreFetch = stubFetch({ handshake: 'luwi-dsh-sync/panel', config: { panelSeats: 'both', panelOps: true } })
   const { ctx, state } = makeCtx(services)
@@ -311,17 +311,23 @@ test('面板渲染: 有快照时三档页签与两根镜像都在, 成本预告�
     const panelComponent = state.registrations.find(r => r.spec.name === 'main').component
     const text = textsOf(panelComponent({})).join(' | ')
     assert.match(text, /已挂载/)
-    assert.match(text, /总览/)
-    assert.match(text, /操作/)
-    assert.match(text, /诊断/)
     assert.match(text, /PC/)
-    assert.match(text, /runner=subprocess/)
+    // 2026-10-24: runner=subprocess 那个徽标改成中文了 (「本机进程」/「手机桥接」)
+    assert.match(text, /本机进程/)
     assert.match(text, /v=0\.2\.24/)
     assert.match(text, /会话/)
     assert.match(text, /工作区/)
     assert.match(text, /221/)
     assert.match(text, /187\.8 MB/)
-    assert.match(text, /名片/)
+    // 2026-10-22 主人: 配对操作放最上方 —— 配对卡必须排在仓库卡前面
+    const atPair = text.indexOf('配对手机')
+    const atRepo = text.indexOf('仓库')
+    assert.ok(atPair >= 0, '配对卡要在页面上')
+    assert.ok(atRepo > atPair, '配对卡要排在仓库卡前面')
+    // 2026-10-22 主人: 诊断板块与名片撤掉
+    assert.doesNotMatch(text, /诊断/)
+    assert.doesNotMatch(text, /名片/)
+    assert.doesNotMatch(text, /自检/)
   } finally {
     for (const effect of state.effects) { if (typeof effect.off === 'function') effect.off() }
     for (const off of state.injectedCleanups) off()
@@ -400,6 +406,108 @@ test('面板渲染: 对端那一块按快照画出来 (令牌只有打码形态)
     const without = await run(base)
     assert.doesNotMatch(without, /跨设备对端/)
   } finally {
+    restore()
+  }
+})
+
+// ── 账号登录 (2026-10-23): 未登录不给生成配对码 ──────────────────────────────
+
+/** 收集元素树里所有 button 的 props (断言 disabled / title 用)。 */
+function buttonsOf(element, out = []) {
+  if (element === null || element === undefined || typeof element === 'boolean') return out
+  if (typeof element === 'string' || typeof element === 'number') return out
+  if (Array.isArray(element)) { for (const child of element) buttonsOf(child, out); return out }
+  if (typeof element === 'object') {
+    if (typeof element.type === 'function') return buttonsOf(element.type(element.props), out)
+    if (element.type === 'button') out.push(element.props ?? {})
+    if (Array.isArray(element.children)) for (const child of element.children) buttonsOf(child, out)
+  }
+  return out
+}
+
+/**
+ * 把函数型组件就地展开成普通元素树 (桩 React 没有渲染器; 只展开**一次**, 免得重复渲染把
+ * fakeReact 的状态队列耗光 —— 队列一空, 第二次渲染看到的是"通道没开"的壳)
+ * @param {unknown} element - 元素 / 数组 / 文本。
+ * @returns {unknown} 展开后的树。
+ */
+function expand(element) {
+  if (element === null || element === undefined || typeof element !== 'object') return element
+  if (Array.isArray(element)) return element.map(expand)
+  const children = Array.isArray(element.children) ? element.children.map(expand) : element.children
+  if (typeof element.type === 'function') return expand(element.type(element.props))
+  return { ...element, children }
+}
+
+test('面板渲染: 未登录时生成配对码是灰的, 登录后显示账号与到期', async () => {
+  const { definition, restore } = await loadBundle()
+  const snapshot = {
+    ok: true,
+    handshake: 'luwi-dsh-sync/panel',
+    v: 4,
+    plugin: 'luwi-dsh-sync',
+    version: '0.3.3',
+    serverTime: 1000,
+    mount: { mounted: true, runner: 'subprocess' },
+    config: { deviceName: 'PC', remoteState: 'set', panelOps: true, panelSeats: 'both', branch: 'main' },
+    peers: { cards: [{ deviceId: 'p1', name: 'PC' }], broken: 0 },
+    op: null,
+    mirrors: [
+      {
+        target: 'sessions',
+        label: '会话',
+        on: true,
+        remote: { state: 'set', display: 'https://example.com/r.git' },
+        cost: { files: 3, bytes: 2048, truncated: false },
+        meta: { deviceId: 'dev-1' },
+        status: { ok: true, branch: 'main', head: 'f'.repeat(40), remoteHead: 'f'.repeat(40), ahead: 0, behind: 0, dirty: [], forks: [] },
+      },
+    ],
+  }
+  const services = sidebarServices()
+  const restoreFetch = stubFetch({ handshake: 'luwi-dsh-sync/panel', config: { panelSeats: 'both', panelOps: true } })
+
+  /**
+   * 用一份 license 渲染一次单页。
+   * @param {object|null} license - 快照里的 license 块 (null = 从未登录)。
+   * @returns {Promise<{text: string, buttons: object[]}>} 文本与按钮。
+   */
+  async function render(license) {
+    const React = fakeReact([0, license === null ? snapshot : { ...snapshot, license }, null])
+    const { ctx, state } = makeCtx(sidebarServices())
+    try {
+      const mod = definition.factory(() => React)
+      mod.apply(ctx)
+      await flush()
+      const component = state.registrations.find(r => r.spec.name === 'main').component
+      const tree = expand(component({}))
+      return { text: textsOf(tree).join(' | '), buttons: buttonsOf(tree) }
+    } finally {
+      for (const effect of state.effects) { if (typeof effect.off === 'function') effect.off() }
+      for (const off of state.injectedCleanups) off()
+    }
+  }
+
+  try {
+    const anonymous = await render(null)
+    assert.match(anonymous.text, /未登录/)
+    assert.match(anonymous.text, /登录 Luwi 账号/)
+    const blocked = anonymous.buttons.find(button => button.title === '生成配对码前要先登录')
+    assert.ok(blocked, '未登录时那颗按钮要写明原因')
+    assert.equal(blocked.disabled, true, '未登录时不能生成配对码')
+
+    const signedIn = await render({ state: 'active', login: 'octo', expiresAt: Date.now() + 86_400_000, hasToken: true })
+    assert.match(signedIn.text, /@octo/)
+    assert.match(signedIn.text, /退出登录/)
+    assert.doesNotMatch(signedIn.text, /登录 Luwi 账号/)
+    assert.equal(signedIn.buttons.some(button => button.title === '生成配对码前要先登录'), false)
+
+    // 过期的人仍然能生成配对码 (要去续费), 但面板要说清
+    const expired = await render({ state: 'expired', login: 'octo', expiresAt: 1, graceUntil: 2, hasToken: true })
+    assert.match(expired.text, /已到期, git 同步照旧可用/)
+    assert.equal(expired.buttons.some(button => button.title === '生成配对码前要先登录'), false)
+  } finally {
+    restoreFetch()
     restore()
   }
 })

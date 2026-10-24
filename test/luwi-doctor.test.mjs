@@ -348,3 +348,38 @@ test('runDoctor does not fail the phone-shaped tree (plugin and peers in one nod
   assert.match(report.warnings.join('\n'), /解析落在本插件所在的那一层/u)
   assert.match(report.notes.join('\n'), /② 层扫描跳过/u)
 })
+
+test('formatDoctor renders the p2p status shell (unavailable is a line, not a failure)', () => {
+  const report = {
+    status: 'PASS',
+    mount: { mounted: true, runner: 'subprocess' },
+    selfDir: 'C:/plugin',
+    profileModulesDir: 'C:/profile/node_modules',
+    layout: 'pnpm 账本 1 个 / 盘上 1 个',
+    peers: [],
+    deps: [],
+    extraneous: [],
+    kept: [],
+    git: { ok: true, text: 'git version 2.54.0' },
+    problems: [],
+    warnings: [],
+    notes: [],
+    p2p: { available: false, running: false, reason: 'P2P_UNAVAILABLE', detail: 'no sidecar binary found', candidates: [] },
+  }
+  const text = formatDoctor(report)
+  assert.match(text, /p2p\s+: unavailable — P2P_UNAVAILABLE/u)
+  assert.match(text, /no sidecar binary found/u)
+
+  const running = formatDoctor({ ...report, p2p: { available: true, running: true, endpointId: 'a'.repeat(64), dataPort: 41000, binary: 'C:/plugin/native/win32-x64/lwiroh.exe' } })
+  assert.match(running, /p2p\s+: up — aaaaaaaaaaaa… via 41000/u)
+  assert.match(running, /lwiroh\.exe/u)
+  assert.match(running, /p2p path\s+: 还没试过/u)
+
+  const relayed = formatDoctor({
+    ...report,
+    p2p: { available: true, running: true, endpointId: 'b'.repeat(64), dataPort: 1, path: 'relay', rttMs: 812, trustState: 'trusted', peerName: 'PC', sas: '042317', cooling: true, lastError: { code: 'P2P_TIMEOUT', message: 'session exceeded 20000ms' } },
+  })
+  assert.match(relayed, /p2p path\s+: 中转 812 ms \(本趟可能慢\) · 冷却中/u)
+  assert.match(relayed, /p2p trust\s+: 已信任 · PC · SAS 042 317/u)
+  assert.match(relayed, /p2p error\s+: P2P_TIMEOUT/u)
+})

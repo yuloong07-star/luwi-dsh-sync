@@ -5,6 +5,260 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+## [0.3.5] - 2026-10-24
+
+### Added
+
+- **Check-in straight from the panel (2026-10-24).** The account row gained a `签到` button to the left
+  of `刷新权益`: the host posts to `POST /api/checkin` with the local device token (the site now accepts
+  `Authorization: Bearer` next to the browser cookie), then refreshes the entitlement so the expiry on
+  the panel moves right away. `panel-routes` gained the `checkin` op; a signed-out host answers with
+  `not signed in on this machine`.
+- **Panel cleanup (2026-10-24).** The sync master switch moved to the right end of the `已挂载` row and
+  turns green while sync is on; configured fields (repository, token) show eight dots and clear on the
+  first click; the workspace-root row is gone (the workspace mirror itself is still a hand-written
+  config option); the duplicate `配对` line, the `刷新状态` button and the always-hidden branch input
+  are gone (branch lives under `高级`); the run-result card is a one-line summary with the raw JSON
+  folded into `全部字段`; the `runner=` badge reads `本机进程` / `手机桥接`.
+
+- **The first real device↔PC P2P session** (2026-10-22, T7 core). With the new APK installed, the phone
+  host spawned `liblwiroh.so` from `nativeLibraryDir`, published a card carrying its `p2p.nodeId`/ticket,
+  and a PC sidecar dialled it over the public relay (1448 ms). One session then served the PC's
+  `live/` file (39 bytes) and pulled the phone's peer card plus its `conv/<device>/<session>/` set —
+  byte content verified by sha on arrival; the phone received the PC's live file. Mailbox entries for
+  other device ids were skipped as author mismatches, exactly as the rules require. Two bugs surfaced
+  and were fixed along the way (the `.p2p` leak into the API push, and a getter leaking into `HELLO`).
+- **P2P readings on the panel and in the doctor (the plan's T6, readings half)** (2026-10-22). The panel
+  snapshot gained an optional `p2p` block (`readP2p`), and the sidebar card renders the three-tier copy
+  from §7.4: `直连 43 ms` / `中转 812 ms · 本趟走中转可能慢` / `对端不在, 走 git`, plus the trust state
+  (`新对端已加入` / `已信任` / `换机待确认` / `已吊销`), the six-digit SAS, sent/received counters, the
+  cooling flag and the last error. The card also carries the two trust actions: `确认换机` appears for a
+  blocked `changed` peer and `吊销这个对端` for the current one; both go through `POST /op`
+  (`p2p-confirm` / `p2p-revoke`, confirm + `deviceId`, panelOps-gated) and rewrite `.p2p/trust.json`.
+  `sync_doctor` prints the same three tiers plus trust/SAS/cooling and the last P2P error code.
+- **P2P identity, trust table and SAS (the plan's T5)** (2026-10-22). The sidecar now keeps a stable
+  ed25519 identity when given `LW_KEY_FILE` (32 raw bytes, mode 0600, generated once and reused —
+  proven on device and across restarts). `lib/p2p-trust.mjs` stores per-device `nodeId` trust in
+  `<repoDir>/.p2p/trust.json` (git-ignored, atomic, unknown keys kept): first sight is trusted, a changed
+  `nodeId` is `P2P_NODE_CHANGED` and blocks the dial, a revoked peer is never dialled, and `SAS` derives
+  the same six digits on both ends from the sorted node ids. Peer cards now carry a `p2p` section
+  (`nodeId`/`ticket`) that the card reader/writer round-trips and preserves across rewrites; the service
+  consults the trust table before every dial, writes new peers, reports `trustState`/`blockedPeer`/`sas`,
+  and the own card is written with our `p2p.nodeId` once the sidecar is up. Inbound checks compare the
+  sidecar's node id (not the repo device id).
+- **P2P service and engine hooks (the plan's T4, continued)** (2026-10-22). `lib/p2p-service.mjs` resolves
+  the peer from the `p2p.nodeId` line in `peers/*.json` (skipping our own card and refusing to dial before
+  the engine's device id exists), runs the two-segment session once per `push`/`pull` via
+  `beforeSync()`, and owns the resident lifecycle (inbound loop for every enabled profile, 60 s heartbeat
+  for `resident`). `P2pRunner` gained the inbound loop and dial-target precedence
+  (ticket → nodeId → device id). In `index.mjs` a P2P attempt now precedes `pushSync`/`runPullSync`
+  (failures fall through to the existing transport and warn once), `sync_doctor` reports the runner's
+  status, and a mount-scoped effect starts/stops the resident half. Everything stays inert while
+  `p2p.enabled` is false, which is still the default.
+- **P2P runner: budget, breaker and readings (the start of the plan's T4)** (2026-10-22).
+  `lib/p2p-runner.mjs` wraps the sidecar and the session state machine into a schedulable action:
+  outbound (`ensure` → dial → session) and inbound (accept → peer-id check → same machine), a 20 s
+  session budget that closes the stream on timeout, a 3-failure → 60 s breaker (`P2P_BUSY` while cooling,
+  one success resets it), a 60 s heartbeat hook, and the §7.4 status shape (`path`/`rttMs`/counters/
+  `cooling`/`lastError`/`gc`). Failures return `{ok:false}` instead of throwing so the engine can fall
+  back to git without a delay.
+- **P2P garbage collection (the plan's T3 tail)** (2026-10-22). `lib/p2p-gc.mjs` handles the three
+  reclaimable leftovers from §6.3 and leaves the mailbox alone: `.p2p/tmp` is cleared at startup or
+  after 24 h; a revoked or 90-day-unseen peer loses only its `base/<peerId>/` manifest cache; and a path
+  that is absent from the peer's manifest for two consecutive rounds *and* has a local copy older than
+  30 days is deleted through the same tombstone path (trash + `.p2p/deleted.json`). All three counters
+  fold into `status.p2p.gc` via `gcSummary`.
+- **P2P peer sessions and a real loopback e2e (the plan's T3 core)** (2026-10-22).
+  `lib/p2p-peer.mjs` runs one session over any frame stream: HELLO (version + device id checked),
+  HEADS, then two half-duplex segments ordered by device id — pull a root's manifest (paged), diff it,
+  `NEED` the missing paths, consume `BLOB`s in batches, apply single files atomically and `conv` sets only
+  after the whole set verifies, answer `MANIFEST_REQ`/`NEED` for the other side, and propagate
+  tombstones into `.p2p/trash` (never touching the mailbox or the local device's files). `P2pSidecar`
+  now opens both directions of the data plane (`openFrameStream` / `acceptInbound`, `p2p.inbound`
+  defaults on) and closes its callback server on `stop()`. The opt-in loopback test (`LW_P2P_E2E=1`)
+  drives two real sidecars over QUIC and moves a live file, a conv set and a tombstone deletion.
+- **P2P apply and manifests (the plan's T3, continued)** (2026-10-22). `lib/p2p-apply.mjs` encodes the
+  author rules (`maySend`/`mayReceive`, with the mailbox exception), rejects absolute/`..`/NUL paths,
+  writes single files atomically with sha256 verification, finalises a `conv/<device>/<session>/` set only
+  after the whole set verifies (old copy goes to `.p2p/trash/<date>/`), and applies tombstones — own
+  paths only, never the mailbox, 200 paths / 32 MiB per round, deletions recorded in `.p2p/deleted.json`
+  so a later git push does not turn them into remote deletions. `lib/p2p-manifest.mjs` builds per-root
+  manifests (one row per `conv` session, 5000-row pages), cross-device stable digests, and the
+  missing/changed diff that becomes `NEED`.
+- **P2P wire frames (the start of the plan's T3)** (2026-10-22). `lib/p2p-frame.mjs` implements the
+  8-byte `LW`/version/type/length header, a streaming decoder that survives arbitrary chunk splits, the
+  nine frame types from §5.4/§5.5 (including `MANIFEST_REQ`), and the `BLOB` body shape (self-describing
+  JSON header + raw bytes). Bad magic, version mismatch, unknown types and bodies over 8 MiB all raise
+  `P2P_PROTOCOL`; business semantics stay in the frame layer's callers, not here.
+- **P2P sidecar supervision (the plan's T2)** (2026-10-22). New `lib/p2p-config.mjs` + `lib/p2p-sidecar.mjs`
+  turn the optional `p2p` config section into a supervised local process: the binary is looked up next to
+  `libnode.so` on Android / under `native/win32-x64/` on the desktop, spawned with a per-process token and
+  ephemeral ports, `READY` is parsed for the control/data ports, and `/v1/id` supplies the endpoint id and
+  ticket. Without a binary `status()` reports `available:false` + `P2P_UNAVAILABLE` (it never throws), an
+  unexpected exit is restarted twice (2 s / 10 s backoff) and then reported as `P2P_CRASH`, and `stop()`
+  asks `/v1/shutdown` before falling back to a kill. `sync_doctor` prints a `p2p` line, and nothing in this
+  layer implements the sync protocol — it only moves bytes for the frame layer that follows (T3+).
+- **The dialogue has its own append-only ledger (`conv/`)** (2026-10-22, the plan's P1). The `live/`
+  snapshot is a rolling window (40 entries / 16 000 chars), so a projection whose cursor fell behind
+  that window lost the stretch in between for good. Every device now appends its settled
+  user/assistant entries to `conv/<device>/<session>/chunks/…` — 16 entries per chunk, one JSON
+  object per line, each carrying the host event `seq`. Sealed chunks never change, so a push only
+  carries the tail chunk (a few KB) and a turn no longer leans on the multi-MB archive to keep the
+  dialogue; the ledger is written from the same `condense` pass as the live snapshot, so the two
+  cannot disagree. `meta.json` carries `chunkEntries` / `entries` / `chunks` / `bytes` / `sha256`,
+  the append is idempotent by `seq`, and `conv/` is single-writer: only the owning device writes its
+  own folder (`ownershipOfPath` keeps a pull from forking it).
+- **Folding a peer's answers fills from that ledger when the window moved** (2026-10-22). If the
+  peer's snapshot is truncated and the local cursor sits before its first entry, the missing stretch
+  is read from `conv/<peer>/<session>/` and merged by `seq` before `proxyEventsFrom`, so rounds the
+  peer ran while this device was offline no longer punch a hole in the projection.
+
+### Fixed
+
+- **One dialer per pair, a configurable session budget, quieter inbound idling** (2026-10-23). Two hosts dialling each other at the same minute produced two concurrent sessions over one mirror (the peer closed the stream at the MANIFEST stage); only the lexicographically smaller `deviceId` dials now — a session is already bidirectional. `p2p.sessionTimeoutMs` (default 20 s, up to 300 s) is the session budget, and an inbound accept timeout no longer overwrites the last real outbound error.
+- **A line from the phone could sit unread for the rest of the hour** (2026-10-23). Inbox consumption only hung off the tail of a pull: when that tail did not run (a line that arrived through the P2P session after the payload pull, a stalled engine call), the file stayed in `inbox/<device>/` and the phone showed "sent, no reply" — one `你好` waited from 12:46 to 13:39. A dedicated 15 s poll now consumes the queue on its own, sharing one in-flight promise with the pull path so a line cannot be delivered twice; the receipt is written within one tick of arrival.
+
+
+
+
+- **The first real device session carried no device id in HELLO** (2026-10-22, found in the PC↔phone
+  run). `P2pService` hands the runner a *getter* for the engine's device id (meta arrives after mount),
+  but the runner passed that function straight into `P2pPeerSession` — `JSON.stringify` turned it into
+  nothing, so the peer saw `deviceId: undefined` and refused with `P2P_UNTRUSTED`. The runner now
+  resolves the getter when a session starts (regression test included).
+- **The API push uploaded the P2P private key** (2026-10-22, caught during the first cross-device run).
+  The `noGit` path (Android) builds the Git tree by walking `repoDir` itself and only skipped `.git`;
+  the new `.p2p/` directory (ed25519 key, trust table, tmp/trash) was therefore pushed to the remote,
+  and the PC pulled it into its worktree. `readLocalTreeFromFs` now skips `.p2p` at the root, a regression
+  test asserts a `.p2p/node.key` never becomes a blob, and the exposed keys were deleted on both hosts
+  (the sidecar generates a fresh identity on its next start, and the trust tables rebuild on first sight).
+- **A folded answer left the projection session unloadable** (2026-10-22). The synthetic
+  `assistant/message` had no `message.source`, and the store's V4 format refuses any durable message
+  without a producer-owned `source.kind` — the whole log was then reported as `stored log is
+  corrupt` and the conversation pane came up empty. The log itself had the exchange, which is why
+  the live view looked fine until a page reload or a host restart. Folded answers now carry
+  `source: { kind: 'model', provider: 'luwi-peer', model: 'luwi-peer' }`, the shape the host writes
+  for its own answers; existing projection logs were repaired in place (the attribution was added
+  to every durable message that lacked one).
+
+### Changed
+
+- **A parts set is one unit on both sides: pulled whole, pushed whole** (2026-10-22). Parts are
+  updated one by one, so a pull that decided per path could keep the remote's `0004.bin` next to
+  the local `0005.bin`, and a push that unioned per path could put two lineages into one set — the
+  `sha256` in `parts/index.json` only stopped the damage at the adopt step (the set stayed broken
+  in the mirror). The pull now decides per set: it reads the remote index first, takes the set only
+  when its `bytes` beats the local one (index bytes, or the flat session file when the local side
+  has not been cut yet), then writes the parts and the index last. The push applies the same rule
+  in reverse: a local set that wins overwrites the same names and lists the remote's extra parts as
+  deletions; a remote set that wins leaves the local parts out of the push entirely. A set that
+  loses keeps its bytes in git history (the pull checkpoint or the remote commit); it is not copied
+  into a fork file, because fork files never travel and a forked set would only add noise on both
+  sides.
+- **A mirror round no longer deletes the extra parts of a longer set** (2026-10-22). When the mirror
+  already holds a set that is longer than what the local session store has (a peer just appended, or
+  a fresh pull has not been adopted yet), the mirror skipped the write — but the delete phase still
+  reconciled against the *local* cut, so the parts beyond it were removed and had to be downloaded
+  again. Every existing part file now counts as a target for that round: neither overwritten nor
+  deleted.
+- **The first pull of a big session is bounded per trip** (2026-10-22). A fresh device used to
+  fetch every part of every set in one call (the mirror here is 8 sets / 14 MB, the largest 5.7 MB
+  in 22 parts), which pushed the queued `inbox/` lines behind it and could run into the 240 s pull
+  deadline. A trip now takes whole sets only — smallest first, up to 32 parts and 4 MiB, always at
+  least one — and leaves the rest for the next minute. A trip that defers a set does not stamp the
+  six-hour head cache, so the next pull keeps going; the parts already fetched are skipped by sha,
+  so finishing a set needs no extra bookkeeping.
+- **An incomplete parts set is `deferred`, not a failure, and a part file is never adopted alone**
+  (2026-10-22). Adopting used to list a missing or half-written set under `failed`, which read as
+  a real error every time a pull landed mid-set; it now lands in `deferred` and is retried.
+  A `parts/*.bin` with no `index.json` next to it is skipped entirely (it used to be adopted as a
+  plain file into the session store, leaving a `parts/` directory there).
+- **The pull and push readings now show what the parts path cost** (2026-10-22): the pull result
+  carries `partSetsTaken` / `partSetsDeferred` / `partsFetched` / `bytesFetched` (and `deferred`
+  for the sets still landing), the push result carries `uploadedParts`. Without them "did it save
+  anything" was a guess.
+
+- **The panel is one page: pairing first, diagnostics and device cards gone** (2026-10-22). The
+  three internal tabs (Overview / Actions / Diagnostics) are merged into a single scroll: the
+  pairing card sits at the top (the first thing you do on a new phone is scan a code, so it leads),
+  then the repository card, the mirror readings, the pull/push actions, and the peer channel. The
+  diagnostics tab, its "self-check" / "copy report" buttons, and the peer-card block are removed —
+  `doctor` and `peers` still exist on the host side (`/sync doctor`, the tools), the panel just does
+  not show them any more.
+- **Session logs travel as zstd frames, so a push no longer re-uploads the whole file** (2026-10-22).
+  On this desktop the sync can only reach GitHub through the REST transport (`github.com:443` is
+  blocked here), and that transport has no delta: any changed blob is uploaded whole. A session
+  log grows by 60~80 KB per turn, and every turn was re-uploading the full 3~5 MB file. The host
+  writes those logs as append-only multi-frame zstd (a 5.5 MB session is 4077 frames of ~1.4 KB),
+  so the mirror now cuts them at frame boundaries into `parts/0000.bin`, `parts/0001.bin`, … plus a
+  small `parts/index.json` (`file` / `bytes` / `parts`). Sealed parts never change, so blob-sha
+  dedupe skips them and a push only carries the growing tail, bounded by the part size (256 KiB).
+  Reassembly is a plain concatenation: byte-for-byte identical to the source file, verified against
+  the live session store. Sessions under 256 KiB and non-zstd files keep the old single-file
+  layout, and a session that switches layouts has its old flat copy deleted in the same round.
+- **The per-session size cap goes from 4 MB to 16 MB** (2026-10-22, the owner's call). The 4 MB
+  cap existed because a whole-file upload made a multi-MB session too expensive to re-send every
+  turn; with parts a push only carries the tail, so the cap is now about what the other device has
+  to download on first sight, and 16 MB covers even long sessions.
+- **`parts/index.json` carries `sha256` of the assembled bytes.** Parts are updated one by one,
+  which leaves a window where the remote part and the local part at the same index come from two
+  different lineages (both sides typed into the same session). Reassembly now refuses a set whose
+  digest does not match: that pull keeps the local session and the next mirror round re-cuts it
+  from the local source, instead of writing a blend of two sessions into the session store.
+- **A pull no longer re-reads the whole mirror every tick** (2026-10-22). Two costs stacked up
+  under a one-minute pull interval: `finishExternalPull` ran even when the remote head had not
+  moved (so every tick re-assembled every parts session — 16 MB of sessions is 16 MB of reads per
+  minute), and each assembly rebuilt the full file just to compare its length. The adopt step now
+  runs only when the API pull actually brought something, and it skips a parts directory whose
+  `bytes:parts:sha256` fingerprint and local file size are unchanged. A quiet minute is now one
+  metadata request; a busy one only reassembles the sessions that changed.
+
+### Changed
+
+- **One knob for the P2P cadence: the periodic pull interval** (2026-10-23). A resident profile used
+  to run a 60 s `p2p.heartbeatMs` timer *and* get a P2P attempt before every `pullSync`, so a
+  one-minute pull interval dialled the peer twice in the same minute. The heartbeat is now armed only
+  when there is no periodic pull (`pullIntervalMinutes === 0`), where it stays the 60 s fallback; with
+  a periodic pull the sync cycle is the only pace, exactly the interval the settings page shows. The
+  switch is hot: `index.mjs` re-arms or stops the timer from the same 3 s watch that re-arms the pull
+  timer, so changing the slider needs no host restart. Readings grew `heartbeatMs` / `heartbeatOn`
+  (`p2p.status` → `lw_sync op=status` / the panel), and `P2pService.syncHeartbeat()` is the single
+  place that decides. Note `power: charging|ondemand` still never starts the heartbeat — only
+  `resident` does, and `periodicPull` always suppresses it.
+
+## [0.0.2] - 2026-10-15
+
+### Added
+
+- **The sync panel can write the configuration** (a `configure` op plus the Repository card
+  in the Actions tab): fill in the git remote, set the branch and flip the sync switch
+  without editing `$DSH_HOME/lw/session-sync.json` by hand. Turning sync off parks the
+  address in `lw.savedRemote` and zeroes the three auto values, exactly like the phone's
+  settings page does; turning it on puts them back. Every key this layer does not own is
+  kept byte for byte.
+- **The file layer now works on a desktop host too.** `readLuwiSyncConfig` only ever looked
+  at `env.DSH_HOME`, and the Electron main process does not put that into the host's
+  environment — it passes the profile directory as argv. So on a desktop the JSON layer was
+  empty all along, and the panel could write an address that nothing ever read (the
+  symptom: `remoteState: unset` while the address sits in the file). The home directory is
+  now derived from the parent of `sessionRoot`, which is always available.
+
+### Fixed
+
+
+
+
+- **A session could vanish right after a line was typed into it, and the answer would land
+  in a different session** (a real device, 2026-10-15). Two rules were fighting each other:
+  the desktop reported its session list without the sessions the peer had reported back (an
+  echo guard), and the phone reported the desktop's own adopted copies straight back to it —
+  so the desktop stopped reporting a session the phone was actively projecting, the phone
+  concluded the peer no longer had it, and archived its own projection (hiding a session
+  from every grouped list). The echo guard now always reports a session that is running,
+  and a session the peer *did* report this round is only dropped from the projection ledger,
+  never archived.
 ## [0.2.24] - 2026-10-10
 
 ### Changed
@@ -86,6 +340,9 @@ undefined
 
 ### Fixed
 
+
+
+
 - The conflict fork notice no longer writes the harness-retired `{ kind: 'plugin', plugin: … }` message source. DeepSeek Harness `0.1.7-alpha.1` turned `MessageSourceMap` into a merge-extensible producer-owned union with no shared `plugin` catch-all, and `@deepseek-ai/dsh-session-format-v3-to-v4`'s `assertV4MessageSources` refuses `kind === 'plugin'` when a session is read back, so a notice written by an earlier build left the forked session readable but not continuable. `injectForkNotice` now writes `{ kind: 'dsh-session-sync', form: 'notice', summary: … }` — the plugin's own producer-owned kind, declared by declaration merging in `types.d.ts`. `form` and `summary` are unchanged, so no user-visible behavior changes.
 
 - `scripts/loader-runner.mjs` sweeps `ctx.registry` for `FiberState.FAILED` fibers after `ctx.loader.await()` and rethrows their `_error`. `cordis-plugin-loader` 1.0.4 (the loader the 0.1.7 host vendors) catches an import failure inside `Entry._init`, logs it and returns, and `EntryTree.await` settles its tasks with `Promise.allSettled`, which never rejects — so a failed mount stopped propagating and the invalid-config and default-export regression cases were exiting non-zero for the wrong reason (`the /sync command is missing`). `FiberState` is a `const enum` with no runtime object, so its `FAILED` value (`3`) is mirrored.
@@ -118,6 +375,9 @@ undefined
 ## [0.2.15] - 2026-09-18
 
 ### Fixed
+
+
+
 
 - The storage-domain handle no longer leaks across an unmount that lands while `ctx.storageDomain.open` is still in flight. The domain effect is registered synchronously inside the apply frame and owns the handle, so the disposer closes the domain once the open settles instead of throwing `INACTIVE_EFFECT` into a swallowed rejection. The silent `.catch(() => {})` is gone: an open or close failure now warns with its reason, and consumers still await the table promise.
 
@@ -154,17 +414,26 @@ undefined
 
 ### Fixed
 
+
+
+
 - Generate the git-backend fork timestamp as strictly 14 digits: `lib/engine.mjs` stripped only `-` and `:` from `toISOString()` before slicing 14 characters, so the ISO `T` survived (`20260909T13523`), `forkFileName`'s `/^\d{14}$/` check failed, and every git-backend conflict fork silently fell back to the epoch stamp `19700101000000`. The stamp now removes `-`, `:` and `T` exactly like `lib/encrypted.mjs`, yielding a real `yyyyMMddHHmmss` UTC stamp; the encrypted backend was already correct and no other behavior changes. Regression tests assert a 14-digit non-epoch stamp on a real fork path plus the acceptance/fallback contract in `test/paths.test.mjs`.
 
 ## [0.2.11] - 2026-09-09
 
 ### Fixed
 
+
+
+
 - Map fork files to sessions with the host's real session-store layout `$DSH_HOME/sessions/<projectKey>/<sessionId>/<file>`: the session-level fork lookup treated the project key as a session id, so on harness `dsh-v0.1.5-alpha.1` (session format V3, zstd by default) every session-level fork and its `sync/conflict` event was silently skipped while the fork files were still kept. `lib/paths.mjs` now exposes `sessionIdOfForkPath` and `decodeSegment` (the inverse of the host's `~XXXX` segment escaping), `handleForks` uses them and warns instead of staying silent when a fork path cannot be mapped, and the legacy flat `<mirrorDir>/<sessionId>/<file>` layout still maps when the last segment looks like a file. The byte-level mirror, merge, and encryption path is unchanged; no new dependencies.
 
 ## [0.2.10] - 2026-09-09
 
 ### Fixed
+
+
+
 
 - Restore a green `pnpm install --frozen-lockfile` on pnpm 11: pnpm 11 enables `minimumReleaseAge` by default (1440 minutes) and its frozen-install lockfile supply-chain verification pass ignores `minimumReleaseAgeExclude` — both the exact `@deepseek-ai/dsh-*@0.1.5-alpha.1` entries and an `@deepseek-ai/*` pattern — so the freshly published `0.1.5-alpha.1` dev/test pins failed with `ERR_PNPM_MINIMUM_RELEASE_AGE_VIOLATION` (17 lockfile entries, reproduced locally against a clean store). `pnpm-workspace.yaml` now sets `minimumReleaseAge: 0`, matching the sibling PerryLink plugins, and keeps the exclusion list as the documented intent. The `v0.2.9` tag already carried that list and still failed at the Install step in both Release and CI, which is why `0.2.9` never reached npm; no runtime behavior changes.
 
@@ -190,6 +459,9 @@ undefined
 
 ### Fixed
 
+
+
+
 - Align the `@deepseek-ai/dsh-*` peer ranges to `>=0.1.2-rc.1 <0.2.0`: the older `>=0.1.0-rc.8 <0.2.0` band resolved to only the `0.1.0-rc.8` prerelease under registry-driven resolution and broke fresh tarball installs; no behavior change.
 
 ### Docs
@@ -200,6 +472,9 @@ undefined
 ## [0.2.6] - 2026-09-04
 
 ### Fixed
+
+
+
 
 - Remove the `storage` / `storage-json` / `storage-domain` rows from the bundle patch: the shipped profiles compose that stack through `dsh-base`, so the inserted rows collided with the same ids and made the profile refuse to boot (`duplicate loader entry id: storage`). The patch now mounts only the `session-sync` row; bare profiles compose the storage stack themselves. The manifest test asserts the new patch contract (plugin row only).
 
@@ -243,6 +518,9 @@ undefined
 
 ### Fixed
 
+
+
+
 - Corrected the stale test count in the Development sections (the repo runs 10 `node --test` files, not 6 suites) across the five-language READMEs and `AGENTS.md`, and fixed `ARCHITECTURE.md`'s periodic-pull description to match the code (`ctx.effect` wrapping `setInterval`, not `ctx.setInterval`). Documentation only — no behavior change.
 
 ## [0.1.3] - 2026-08-22
@@ -261,11 +539,17 @@ undefined
 
 ### Fixed
 
+
+
+
 - `scripts/loader-runner.mjs` calls the rc.8 `commands.execute(agent, line, images, signal)` signature (empty image batch), so the real-Loader composition tests run against the rc.8 commands registry.
 
 ## [0.1.1] - 2026-08-17
 
 ### Fixed
+
+
+
 
 - The bundle patch now composes the storage stack (`@deepseek-ai/dsh-storage` + `dsh-storage-json` + `dsh-storage-domain`) and declares all three packages, so a bare profile gets the `storageDomain` service the plugin injects instead of hanging with `pending (waiting for service: storageDomain)`.
 
@@ -280,3 +564,5 @@ undefined
 - Session-level conflict fork with a persistent `user/message` notice when a diverged session is live and has no open turn.
 - `session-sync` storage-domain metadata (device id, last pull/push, last push head, last error).
 - Schemastery configuration with fail-loud bounds; every tunable documented in `cordis.patch.yml` and the five-language READMEs.
+
+
